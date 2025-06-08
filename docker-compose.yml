@@ -5,11 +5,12 @@ services:
     build: .
     ports:
       - "${PORT:-9621}:9621"
-    volumes:
-      - ./data/rag_storage:/app/data/rag_storage
-      - ./data/inputs:/app/data/inputs
-      - ./config.ini:/app/config.ini
-      - ./.env:/app/.env.example
+volumes:
+  - ../files/rag_storage:/app/data/rag_storage
+  - ../files/inputs:/app/data/inputs
+  - ../files/config.ini:/app/config.ini
+  - ../files/env:/app/.env
+
     env_file:
       - .env
     restart: unless-stopped
