@@ -10,7 +10,6 @@ volumes:
   - ../files/inputs:/app/data/inputs
   - ../files/config.ini:/app/config.ini
   - ../files/env:/app/.env
-
     env_file:
       - .env
     restart: unless-stopped
