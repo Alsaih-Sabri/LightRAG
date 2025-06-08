@@ -1,28 +1,18 @@
-version: "3"
-
 services:
   lightrag:
     build: .
     ports:
       - "${PORT:-9621}:9621"
-volumes:
-  - ../files/rag_storage:/app/data/rag_storage
-  - ../files/inputs:/app/data/inputs
-  - ../files/config.ini:/app/config.ini
-  - ../files/env:/app/.env
+    volumes:
+      - ./data/rag_storage:/app/data/rag_storage
+      - ./data/inputs:/app/data/inputs
+      - ./config.ini:/app/config.ini
+      - ./.env:/app/.env
     env_file:
       - .env
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    networks:
-      - dokploy-network
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.lightrag.rule=Host(`lightrag.webget.co.uk`)"  # Change to your domain
-      - "traefik.http.routers.lightrag.entrypoints=websecure"
-      - "traefik.http.routers.lightrag.tls.certResolver=letsencrypt"
-      - "traefik.http.services.lightrag.loadbalancer.server.port=9621"
 
   neo4j:
     image: neo4j:5.26.4-community
@@ -48,7 +38,3 @@ volumes:
   lightrag_neo4j_import:
   lightrag_neo4j_data:
   lightrag_neo4j_backups:
-
-networks:
-  dokploy-network:
-    external: true
