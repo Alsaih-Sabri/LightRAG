@@ -5,7 +5,6 @@ STORAGE_IMPLEMENTATIONS = {
             "RedisKVStorage",
             "PGKVStorage",
             "MongoKVStorage",
-            # "TiDBKVStorage",
         ],
         "required_methods": ["get_by_id", "upsert"],
     },
@@ -14,10 +13,8 @@ STORAGE_IMPLEMENTATIONS = {
             "NetworkXStorage",
             "Neo4JStorage",
             "PGGraphStorage",
-            # "AGEStorage",
-            # "MongoGraphStorage",
-            # "TiDBGraphStorage",
-            # "GremlinStorage",
+            "MongoGraphStorage",
+            "MemgraphStorage",
         ],
         "required_methods": ["upsert_node", "upsert_edge"],
     },
@@ -25,18 +22,18 @@ STORAGE_IMPLEMENTATIONS = {
         "implementations": [
             "NanoVectorDBStorage",
             "MilvusVectorDBStorage",
-            "ChromaVectorDBStorage",
             "PGVectorStorage",
             "FaissVectorDBStorage",
             "QdrantVectorDBStorage",
             "MongoVectorDBStorage",
-            # "TiDBVectorDBStorage",
+            # "ChromaVectorDBStorage",
         ],
         "required_methods": ["query", "upsert"],
     },
     "DOC_STATUS_STORAGE": {
         "implementations": [
             "JsonDocStatusStorage",
+            "RedisDocStatusStorage",
             "PGDocStatusStorage",
             "MongoDocStatusStorage",
         ],
@@ -48,21 +45,25 @@ STORAGE_IMPLEMENTATIONS = {
 STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
     # KV Storage Implementations
     "JsonKVStorage": [],
-    "MongoKVStorage": [],
+    "MongoKVStorage": [
+        "MONGO_URI",
+        "MONGO_DATABASE",
+    ],
     "RedisKVStorage": ["REDIS_URI"],
-    # "TiDBKVStorage": ["TIDB_USER", "TIDB_PASSWORD", "TIDB_DATABASE"],
     "PGKVStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
     # Graph Storage Implementations
     "NetworkXStorage": [],
     "Neo4JStorage": ["NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"],
-    "MongoGraphStorage": [],
-    # "TiDBGraphStorage": ["TIDB_USER", "TIDB_PASSWORD", "TIDB_DATABASE"],
+    "MongoGraphStorage": [
+        "MONGO_URI",
+        "MONGO_DATABASE",
+    ],
+    "MemgraphStorage": ["MEMGRAPH_URI"],
     "AGEStorage": [
         "AGE_POSTGRES_DB",
         "AGE_POSTGRES_USER",
         "AGE_POSTGRES_PASSWORD",
     ],
-    # "GremlinStorage": ["GREMLIN_HOST", "GREMLIN_PORT", "GREMLIN_GRAPH"],
     "PGGraphStorage": [
         "POSTGRES_USER",
         "POSTGRES_PASSWORD",
@@ -70,17 +71,26 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
     ],
     # Vector Storage Implementations
     "NanoVectorDBStorage": [],
-    "MilvusVectorDBStorage": [],
-    "ChromaVectorDBStorage": [],
-    # "TiDBVectorDBStorage": ["TIDB_USER", "TIDB_PASSWORD", "TIDB_DATABASE"],
+    "MilvusVectorDBStorage": [
+        "MILVUS_URI",
+        "MILVUS_DB_NAME",
+    ],
+    # "ChromaVectorDBStorage": [],
     "PGVectorStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
     "FaissVectorDBStorage": [],
     "QdrantVectorDBStorage": ["QDRANT_URL"],  # QDRANT_API_KEY has default value None
-    "MongoVectorDBStorage": [],
+    "MongoVectorDBStorage": [
+        "MONGO_URI",
+        "MONGO_DATABASE",
+    ],
     # Document Status Storage Implementations
     "JsonDocStatusStorage": [],
+    "RedisDocStatusStorage": ["REDIS_URI"],
     "PGDocStatusStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
-    "MongoDocStatusStorage": [],
+    "MongoDocStatusStorage": [
+        "MONGO_URI",
+        "MONGO_DATABASE",
+    ],
 }
 
 # Storage implementation module mapping
@@ -96,18 +106,16 @@ STORAGES = {
     "MongoGraphStorage": ".kg.mongo_impl",
     "MongoVectorDBStorage": ".kg.mongo_impl",
     "RedisKVStorage": ".kg.redis_impl",
+    "RedisDocStatusStorage": ".kg.redis_impl",
     "ChromaVectorDBStorage": ".kg.chroma_impl",
-    # "TiDBKVStorage": ".kg.tidb_impl",
-    # "TiDBVectorDBStorage": ".kg.tidb_impl",
-    # "TiDBGraphStorage": ".kg.tidb_impl",
     "PGKVStorage": ".kg.postgres_impl",
     "PGVectorStorage": ".kg.postgres_impl",
     "AGEStorage": ".kg.age_impl",
     "PGGraphStorage": ".kg.postgres_impl",
-    # "GremlinStorage": ".kg.gremlin_impl",
     "PGDocStatusStorage": ".kg.postgres_impl",
     "FaissVectorDBStorage": ".kg.faiss_impl",
     "QdrantVectorDBStorage": ".kg.qdrant_impl",
+    "MemgraphStorage": ".kg.memgraph_impl",
 }
 
 

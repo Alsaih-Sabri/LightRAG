@@ -6,14 +6,38 @@ import os
 import argparse
 from typing import Optional, List, Tuple
 import sys
+import time
+import logging
 from ascii_colors import ASCIIColors
 from lightrag.api import __api_version__ as api_version
 from lightrag import __version__ as core_version
-from fastapi import HTTPException, Security, Request, status
+from lightrag.constants import (
+    DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
+)
+from fastapi import HTTPException, Security, Request, Response, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from starlette.status import HTTP_403_FORBIDDEN
 from .auth import auth_handler
-from .config import ollama_server_infos, global_args
+from .config import ollama_server_infos, global_args, get_env_value
+
+logger = logging.getLogger("lightrag")
+
+# ========== Token Renewal Rate Limiting ==========
+# Cache to track last renewal time per user (username as key)
+# Format: {username: last_renewal_timestamp}
+_token_renewal_cache: dict[str, float] = {}
+_RENEWAL_MIN_INTERVAL = 60  # Minimum 60 seconds between renewals for same user
+
+# ========== Token Renewal Path Exclusions ==========
+# Paths that should NOT trigger token auto-renewal
+# - /health: Health check endpoint, no login required
+# - /documents/paginated: Client polls this frequently (5-30s), renewal not needed
+# - /documents/pipeline_status: Client polls this very frequently (2s), renewal not needed
+_TOKEN_RENEWAL_SKIP_PATHS = [
+    "/health",
+    "/documents/paginated",
+    "/documents/pipeline_status",
+]
 
 
 def check_env_file():
@@ -84,6 +108,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
 
     async def combined_dependency(
         request: Request,
+        response: Response,  # Added: needed to return new token via response header
         token: str = Security(oauth2_scheme),
         api_key_header_value: Optional[str] = None
         if api_key_header is None
@@ -101,6 +126,80 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
         if token:
             try:
                 token_info = auth_handler.validate_token(token)
+
+                # ========== Token Auto-Renewal Logic ==========
+                from lightrag.api.config import global_args
+                from datetime import datetime
+
+                if global_args.token_auto_renew:
+                    # Check if current path should skip token renewal
+                    skip_renewal = any(
+                        path == skip_path or path.startswith(skip_path + "/")
+                        for skip_path in _TOKEN_RENEWAL_SKIP_PATHS
+                    )
+
+                    if skip_renewal:
+                        logger.debug(f"Token auto-renewal skipped for path: {path}")
+                    else:
+                        try:
+                            expire_time = token_info.get("exp")
+                            if expire_time:
+                                # Calculate remaining time ratio
+                                now = datetime.utcnow()
+                                remaining_seconds = (expire_time - now).total_seconds()
+
+                                # Get original token expiration duration
+                                role = token_info.get("role", "user")
+                                total_hours = (
+                                    auth_handler.guest_expire_hours
+                                    if role == "guest"
+                                    else auth_handler.expire_hours
+                                )
+                                total_seconds = total_hours * 3600
+
+                                # Issue new token if remaining time < threshold
+                                if (
+                                    remaining_seconds
+                                    < total_seconds * global_args.token_renew_threshold
+                                ):
+                                    # ========== Rate Limiting Check ==========
+                                    username = token_info["username"]
+                                    current_time = time.time()
+                                    last_renewal = _token_renewal_cache.get(username, 0)
+                                    time_since_last_renewal = (
+                                        current_time - last_renewal
+                                    )
+
+                                    # Only renew if enough time has passed since last renewal
+                                    if time_since_last_renewal >= _RENEWAL_MIN_INTERVAL:
+                                        new_token = auth_handler.create_token(
+                                            username=username,
+                                            role=role,
+                                            metadata=token_info.get("metadata", {}),
+                                        )
+                                        # Return new token via response header
+                                        response.headers["X-New-Token"] = new_token
+
+                                        # Update renewal cache
+                                        _token_renewal_cache[username] = current_time
+
+                                        # Optional: log renewal
+                                        logger.info(
+                                            f"Token auto-renewed for user {username} "
+                                            f"(role: {role}, remaining: {remaining_seconds:.0f}s)"
+                                        )
+                                    else:
+                                        # Log skip due to rate limit
+                                        logger.debug(
+                                            f"Token renewal skipped for {username} "
+                                            f"(rate limit: last renewal {time_since_last_renewal:.0f}s ago)"
+                                        )
+                                    # ========== End of Rate Limiting Check ==========
+                        except Exception as e:
+                            # Renewal failure should not affect normal request, just log
+                            logger.warning(f"Token auto-renew failed: {e}")
+                # ========== End of Token Auto-Renewal Logic ==========
+
                 # Accept guest token if no auth is configured
                 if not auth_configured and token_info.get("role") == "guest":
                     return
@@ -171,12 +270,24 @@ def display_splash_screen(args: argparse.Namespace) -> None:
         args: Parsed command line arguments
     """
     # Banner
-    ASCIIColors.cyan(f"""
-    ╔══════════════════════════════════════════════════════════════╗
-    ║                  🚀 LightRAG Server v{core_version}/{api_version}              ║
-    ║          Fast, Lightweight RAG Server Implementation         ║
-    ╚══════════════════════════════════════════════════════════════╝
-    """)
+    # Banner
+    top_border = "╔══════════════════════════════════════════════════════════════╗"
+    bottom_border = "╚══════════════════════════════════════════════════════════════╝"
+    width = len(top_border) - 4  # width inside the borders
+
+    line1_text = f"LightRAG Server v{core_version}/{api_version}"
+    line2_text = "Fast, Lightweight RAG Server Implementation"
+
+    line1 = f"║ {line1_text.center(width)} ║"
+    line2 = f"║ {line2_text.center(width)} ║"
+
+    banner = f"""
+    {top_border}
+    {line1}
+    {line2}
+    {bottom_border}
+    """
+    ASCIIColors.cyan(banner)
 
     # Server Configuration
     ASCIIColors.magenta("\n📡 Server Configuration:")
@@ -186,6 +297,8 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.port}")
     ASCIIColors.white("    ├─ Workers: ", end="")
     ASCIIColors.yellow(f"{args.workers}")
+    ASCIIColors.white("    ├─ Timeout: ", end="")
+    ASCIIColors.yellow(f"{args.timeout}")
     ASCIIColors.white("    ├─ CORS Origins: ", end="")
     ASCIIColors.yellow(f"{args.cors_origins}")
     ASCIIColors.white("    ├─ SSL Enabled: ", end="")
@@ -201,8 +314,6 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.log_level}")
     ASCIIColors.white("    ├─ Verbose Debug: ", end="")
     ASCIIColors.yellow(f"{args.verbose}")
-    ASCIIColors.white("    ├─ History Turns: ", end="")
-    ASCIIColors.yellow(f"{args.history_turns}")
     ASCIIColors.white("    ├─ API Key: ", end="")
     ASCIIColors.yellow("Set" if args.key else "Not Set")
     ASCIIColors.white("    └─ JWT Auth: ", end="")
@@ -223,14 +334,10 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.llm_binding_host}")
     ASCIIColors.white("    ├─ Model: ", end="")
     ASCIIColors.yellow(f"{args.llm_model}")
-    ASCIIColors.white("    ├─ Temperature: ", end="")
-    ASCIIColors.yellow(f"{args.temperature}")
     ASCIIColors.white("    ├─ Max Async for LLM: ", end="")
     ASCIIColors.yellow(f"{args.max_async}")
-    ASCIIColors.white("    ├─ Max Tokens: ", end="")
-    ASCIIColors.yellow(f"{args.max_tokens}")
-    ASCIIColors.white("    ├─ Timeout: ", end="")
-    ASCIIColors.yellow(f"{args.timeout if args.timeout else 'None (infinite)'}")
+    ASCIIColors.white("    ├─ Summary Context Size: ", end="")
+    ASCIIColors.yellow(f"{args.summary_context_size}")
     ASCIIColors.white("    ├─ LLM Cache Enabled: ", end="")
     ASCIIColors.yellow(f"{args.enable_llm_cache}")
     ASCIIColors.white("    └─ LLM Cache for Extraction Enabled: ", end="")
@@ -251,10 +358,10 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.magenta("\n⚙️ RAG Configuration:")
     ASCIIColors.white("    ├─ Summary Language: ", end="")
     ASCIIColors.yellow(f"{args.summary_language}")
+    ASCIIColors.white("    ├─ Entity Types: ", end="")
+    ASCIIColors.yellow(f"{args.entity_types}")
     ASCIIColors.white("    ├─ Max Parallel Insert: ", end="")
     ASCIIColors.yellow(f"{args.max_parallel_insert}")
-    ASCIIColors.white("    ├─ Max Embed Tokens: ", end="")
-    ASCIIColors.yellow(f"{args.max_embed_tokens}")
     ASCIIColors.white("    ├─ Chunk Size: ", end="")
     ASCIIColors.yellow(f"{args.chunk_size}")
     ASCIIColors.white("    ├─ Chunk Overlap Size: ", end="")
@@ -263,10 +370,10 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.cosine_threshold}")
     ASCIIColors.white("    ├─ Top-K: ", end="")
     ASCIIColors.yellow(f"{args.top_k}")
-    ASCIIColors.white("    ├─ Max Token Summary: ", end="")
-    ASCIIColors.yellow(f"{int(os.getenv('MAX_TOKEN_SUMMARY', 500))}")
     ASCIIColors.white("    └─ Force LLM Summary on Merge: ", end="")
-    ASCIIColors.yellow(f"{int(os.getenv('FORCE_LLM_SUMMARY_ON_MERGE', 6))}")
+    ASCIIColors.yellow(
+        f"{get_env_value('FORCE_LLM_SUMMARY_ON_MERGE', DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE, int)}"
+    )
 
     # System Configuration
     ASCIIColors.magenta("\n💾 Storage Configuration:")
@@ -276,8 +383,10 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.vector_storage}")
     ASCIIColors.white("    ├─ Graph Storage: ", end="")
     ASCIIColors.yellow(f"{args.graph_storage}")
-    ASCIIColors.white("    └─ Document Status Storage: ", end="")
+    ASCIIColors.white("    ├─ Document Status Storage: ", end="")
     ASCIIColors.yellow(f"{args.doc_status_storage}")
+    ASCIIColors.white("    └─ Workspace: ", end="")
+    ASCIIColors.yellow(f"{args.workspace if args.workspace else '-'}")
 
     # Server Status
     ASCIIColors.green("\n✨ Server starting up...\n")

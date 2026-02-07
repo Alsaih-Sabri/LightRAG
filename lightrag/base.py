@@ -11,14 +11,64 @@ from typing import (
     TypedDict,
     TypeVar,
     Callable,
+    Optional,
+    Dict,
+    List,
+    AsyncIterator,
 )
 from .utils import EmbeddingFunc
 from .types import KnowledgeGraph
+from .constants import (
+    DEFAULT_TOP_K,
+    DEFAULT_CHUNK_TOP_K,
+    DEFAULT_MAX_ENTITY_TOKENS,
+    DEFAULT_MAX_RELATION_TOKENS,
+    DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_HISTORY_TURNS,
+    DEFAULT_OLLAMA_MODEL_NAME,
+    DEFAULT_OLLAMA_MODEL_TAG,
+    DEFAULT_OLLAMA_MODEL_SIZE,
+    DEFAULT_OLLAMA_CREATED_AT,
+    DEFAULT_OLLAMA_DIGEST,
+)
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=".env", override=False)
+
+
+class OllamaServerInfos:
+    def __init__(self, name=None, tag=None):
+        self._lightrag_name = name or os.getenv(
+            "OLLAMA_EMULATING_MODEL_NAME", DEFAULT_OLLAMA_MODEL_NAME
+        )
+        self._lightrag_tag = tag or os.getenv(
+            "OLLAMA_EMULATING_MODEL_TAG", DEFAULT_OLLAMA_MODEL_TAG
+        )
+        self.LIGHTRAG_SIZE = DEFAULT_OLLAMA_MODEL_SIZE
+        self.LIGHTRAG_CREATED_AT = DEFAULT_OLLAMA_CREATED_AT
+        self.LIGHTRAG_DIGEST = DEFAULT_OLLAMA_DIGEST
+
+    @property
+    def LIGHTRAG_NAME(self):
+        return self._lightrag_name
+
+    @LIGHTRAG_NAME.setter
+    def LIGHTRAG_NAME(self, value):
+        self._lightrag_name = value
+
+    @property
+    def LIGHTRAG_TAG(self):
+        return self._lightrag_tag
+
+    @LIGHTRAG_TAG.setter
+    def LIGHTRAG_TAG(self, value):
+        self._lightrag_tag = value
+
+    @property
+    def LIGHTRAG_MODEL(self):
+        return f"{self._lightrag_name}:{self._lightrag_tag}"
 
 
 class TextChunkSchema(TypedDict):
@@ -35,7 +85,7 @@ T = TypeVar("T")
 class QueryParam:
     """Configuration parameters for query execution in LightRAG."""
 
-    mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = "global"
+    mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = "mix"
     """Specifies the retrieval mode:
     - "local": Focuses on context-dependent information.
     - "global": Utilizes global knowledge.
@@ -56,19 +106,28 @@ class QueryParam:
     stream: bool = False
     """If True, enables streaming output for real-time responses."""
 
-    top_k: int = int(os.getenv("TOP_K", "60"))
+    top_k: int = int(os.getenv("TOP_K", str(DEFAULT_TOP_K)))
     """Number of top items to retrieve. Represents entities in 'local' mode and relationships in 'global' mode."""
 
-    max_token_for_text_unit: int = int(os.getenv("MAX_TOKEN_TEXT_CHUNK", "4000"))
-    """Maximum number of tokens allowed for each retrieved text chunk."""
+    chunk_top_k: int = int(os.getenv("CHUNK_TOP_K", str(DEFAULT_CHUNK_TOP_K)))
+    """Number of text chunks to retrieve initially from vector search and keep after reranking.
+    If None, defaults to top_k value.
+    """
 
-    max_token_for_global_context: int = int(
-        os.getenv("MAX_TOKEN_RELATION_DESC", "4000")
+    max_entity_tokens: int = int(
+        os.getenv("MAX_ENTITY_TOKENS", str(DEFAULT_MAX_ENTITY_TOKENS))
     )
-    """Maximum number of tokens allocated for relationship descriptions in global retrieval."""
+    """Maximum number of tokens allocated for entity context in unified token control system."""
 
-    max_token_for_local_context: int = int(os.getenv("MAX_TOKEN_ENTITY_DESC", "4000"))
-    """Maximum number of tokens allocated for entity descriptions in local retrieval."""
+    max_relation_tokens: int = int(
+        os.getenv("MAX_RELATION_TOKENS", str(DEFAULT_MAX_RELATION_TOKENS))
+    )
+    """Maximum number of tokens allocated for relationship context in unified token control system."""
+
+    max_total_tokens: int = int(
+        os.getenv("MAX_TOTAL_TOKENS", str(DEFAULT_MAX_TOTAL_TOKENS))
+    )
+    """Maximum total tokens budget for the entire query context (entities + relations + chunks + system prompt)."""
 
     hl_keywords: list[str] = field(default_factory=list)
     """List of high-level keywords to prioritize in retrieval."""
@@ -76,16 +135,15 @@ class QueryParam:
     ll_keywords: list[str] = field(default_factory=list)
     """List of low-level keywords to refine retrieval focus."""
 
+    # History mesages is only send to LLM for context, not used for retrieval
     conversation_history: list[dict[str, str]] = field(default_factory=list)
     """Stores past conversation history to maintain context.
     Format: [{"role": "user/assistant", "content": "message"}].
     """
 
-    history_turns: int = 3
+    # TODO: deprecated. No longer used in the codebase, all conversation_history messages is send to LLM
+    history_turns: int = int(os.getenv("HISTORY_TURNS", str(DEFAULT_HISTORY_TURNS)))
     """Number of complete conversation turns (user-assistant pairs) to consider in the response context."""
-
-    ids: list[str] | None = None
-    """List of ids to filter the results."""
 
     model_func: Callable[..., object] | None = None
     """Optional override for the LLM model function to use for this specific query.
@@ -93,10 +151,28 @@ class QueryParam:
     This allows using different models for different query modes.
     """
 
+    user_prompt: str | None = None
+    """User-provided prompt for the query.
+    Addition instructions for LLM. If provided, this will be inject into the prompt template.
+    It's purpose is the let user customize the way LLM generate the response.
+    """
+
+    enable_rerank: bool = os.getenv("RERANK_BY_DEFAULT", "true").lower() == "true"
+    """Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued.
+    Default is True to enable reranking when rerank model is available.
+    """
+
+    include_references: bool = False
+    """If True, includes reference list in the response for supported endpoints.
+    This parameter controls whether the API response includes a references field
+    containing citation information for the retrieved content.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):
     namespace: str
+    workspace: str
     global_config: dict[str, Any]
 
     async def initialize(self):
@@ -144,11 +220,56 @@ class BaseVectorStorage(StorageNameSpace, ABC):
     cosine_better_than_threshold: float = field(default=0.2)
     meta_fields: set[str] = field(default_factory=set)
 
+    def _validate_embedding_func(self):
+        """Validate that embedding_func is provided.
+
+        This method should be called at the beginning of __post_init__
+        in all vector storage implementations.
+
+        Raises:
+            ValueError: If embedding_func is None
+        """
+        if self.embedding_func is None:
+            raise ValueError(
+                "embedding_func is required for vector storage. "
+                "Please provide a valid EmbeddingFunc instance."
+            )
+
+    def _generate_collection_suffix(self) -> str | None:
+        """Generates collection/table suffix from embedding_func.
+
+        Return suffix if model_name exists in embedding_func, otherwise return None.
+        Note: embedding_func is guaranteed to exist (validated in __post_init__).
+
+        Returns:
+            str | None: Suffix string e.g. "text_embedding_3_large_3072d", or None if model_name not available
+        """
+        import re
+
+        # Check if model_name exists (model_name is optional in EmbeddingFunc)
+        model_name = getattr(self.embedding_func, "model_name", None)
+        if not model_name:
+            return None
+
+        # embedding_dim is required in EmbeddingFunc
+        embedding_dim = self.embedding_func.embedding_dim
+
+        # Generate suffix: clean model name and append dimension
+        safe_model_name = re.sub(r"[^a-zA-Z0-9_]", "_", model_name.lower())
+        return f"{safe_model_name}_{embedding_dim}d"
+
     @abstractmethod
     async def query(
-        self, query: str, top_k: int, ids: list[str] | None = None
+        self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict[str, Any]]:
-        """Query the vector storage and retrieve top_k results."""
+        """Query the vector storage and retrieve top_k results.
+
+        Args:
+            query: The query string to search for
+            top_k: Number of top results to return
+            query_embedding: Optional pre-computed embedding for the query.
+                           If provided, skips embedding computation for better performance.
+        """
 
     @abstractmethod
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
@@ -217,6 +338,19 @@ class BaseVectorStorage(StorageNameSpace, ABC):
             ids: List of vector IDs to be deleted
         """
 
+    @abstractmethod
+    async def get_vectors_by_ids(self, ids: list[str]) -> dict[str, list[float]]:
+        """Get vectors by their IDs, returning only ID and vector data for efficiency
+
+        Args:
+            ids: List of unique identifiers
+
+        Returns:
+            Dictionary mapping IDs to their vector embeddings
+            Format: {id: [vector_values], ...}
+        """
+        pass
+
 
 @dataclass
 class BaseKVStorage(StorageNameSpace, ABC):
@@ -258,24 +392,19 @@ class BaseKVStorage(StorageNameSpace, ABC):
             None
         """
 
-    async def drop_cache_by_modes(self, modes: list[str] | None = None) -> bool:
-        """Delete specific records from storage by cache mode
-
-        Importance notes for in-memory storage:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. update flags to notify other processes that data persistence is needed
-
-        Args:
-            modes (list[str]): List of cache modes to be dropped from storage
+    @abstractmethod
+    async def is_empty(self) -> bool:
+        """Check if the storage is empty
 
         Returns:
-             True: if the cache drop successfully
-             False: if the cache drop failed, or the cache mode is not supported
+            bool: True if storage contains no data, False otherwise
         """
 
 
 @dataclass
 class BaseGraphStorage(StorageNameSpace, ABC):
+    """All operations related to edges in graph should be undirected."""
+
     embedding_func: EmbeddingFunc
 
     @abstractmethod
@@ -508,7 +637,8 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
     @abstractmethod
     async def get_all_labels(self) -> list[str]:
-        """Get all labels in the graph.
+        """Get all labels(entity names) in the graph.
+        Do not use this method for large graph, use get_popular_labels or search_labels instead.
 
         Returns:
             A list of all node labels in the graph, sorted alphabetically
@@ -522,7 +652,7 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Retrieve a connected subgraph of nodes where the label includes the specified `node_label`.
 
         Args:
-            node_label: Label of the starting node，* means all nodes
+            node_label: Label(entity name) of the starting node，* means all nodes
             max_depth: Maximum depth of the subgraph, Defaults to 3
             max_nodes: Maxiumu nodes to return, Defaults to 1000（BFS if possible)
 
@@ -531,12 +661,53 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             indicating whether the graph was truncated due to max_nodes limit
         """
 
+    @abstractmethod
+    async def get_all_nodes(self) -> list[dict]:
+        """Get all nodes in the graph.
+
+        Returns:
+            A list of all nodes, where each node is a dictionary of its properties
+            (Edge is bidirectional for some storage implementation; deduplication must be handled by the caller)
+        """
+
+    @abstractmethod
+    async def get_all_edges(self) -> list[dict]:
+        """Get all edges in the graph.
+
+        Returns:
+            A list of all edges, where each edge is a dictionary of its properties
+        """
+
+    @abstractmethod
+    async def get_popular_labels(self, limit: int = 300) -> list[str]:
+        """Get popular labels(entity names) by node degree (most connected entities)
+
+        Args:
+            limit: Maximum number of labels to return
+
+        Returns:
+            List of labels sorted by degree (highest first)
+        """
+
+    @abstractmethod
+    async def search_labels(self, query: str, limit: int = 50) -> list[str]:
+        """Search labels(entity names) with fuzzy matching
+
+        Args:
+            query: Search query string
+            limit: Maximum number of results to return
+
+        Returns:
+            List of matching labels sorted by relevance
+        """
+
 
 class DocStatus(str, Enum):
     """Document processing status"""
 
     PENDING = "pending"
     PROCESSING = "processing"
+    PREPROCESSED = "preprocessed"
     PROCESSED = "processed"
     FAILED = "failed"
 
@@ -545,8 +716,6 @@ class DocStatus(str, Enum):
 class DocProcessingStatus:
     """Document processing status data structure"""
 
-    content: str
-    """Original content of the document"""
     content_summary: str
     """First 100 chars of document content, used for preview"""
     content_length: int
@@ -559,12 +728,35 @@ class DocProcessingStatus:
     """ISO format timestamp when document was created"""
     updated_at: str
     """ISO format timestamp when document was last updated"""
+    track_id: str | None = None
+    """Tracking ID for monitoring progress"""
     chunks_count: int | None = None
     """Number of chunks after splitting, used for processing"""
-    error: str | None = None
+    chunks_list: list[str] | None = field(default_factory=list)
+    """List of chunk IDs associated with this document, used for deletion"""
+    error_msg: str | None = None
     """Error message if failed"""
     metadata: dict[str, Any] = field(default_factory=dict)
     """Additional metadata"""
+    multimodal_processed: bool | None = field(default=None, repr=False)
+    """Internal field: indicates if multimodal processing is complete. Not shown in repr() but accessible for debugging."""
+
+    def __post_init__(self):
+        """
+        Handle status conversion based on multimodal_processed field.
+
+        Business rules:
+        - If multimodal_processed is False and status is PROCESSED,
+          then change status to PREPROCESSED
+        - The multimodal_processed field is kept (with repr=False) for internal use and debugging
+        """
+        # Apply status conversion logic
+        if self.multimodal_processed is not None:
+            if (
+                self.multimodal_processed is False
+                and self.status == DocStatus.PROCESSED
+            ):
+                self.status = DocStatus.PREPROCESSED
 
 
 @dataclass
@@ -581,9 +773,53 @@ class DocStatusStorage(BaseKVStorage, ABC):
     ) -> dict[str, DocProcessingStatus]:
         """Get all documents with a specific status"""
 
-    async def drop_cache_by_modes(self, modes: list[str] | None = None) -> bool:
-        """Drop cache is not supported for Doc Status storage"""
-        return False
+    @abstractmethod
+    async def get_docs_by_track_id(
+        self, track_id: str
+    ) -> dict[str, DocProcessingStatus]:
+        """Get all documents with a specific track_id"""
+
+    @abstractmethod
+    async def get_docs_paginated(
+        self,
+        status_filter: DocStatus | None = None,
+        page: int = 1,
+        page_size: int = 50,
+        sort_field: str = "updated_at",
+        sort_direction: str = "desc",
+    ) -> tuple[list[tuple[str, DocProcessingStatus]], int]:
+        """Get documents with pagination support
+
+        Args:
+            status_filter: Filter by document status, None for all statuses
+            page: Page number (1-based)
+            page_size: Number of documents per page (10-200)
+            sort_field: Field to sort by ('created_at', 'updated_at', 'id')
+            sort_direction: Sort direction ('asc' or 'desc')
+
+        Returns:
+            Tuple of (list of (doc_id, DocProcessingStatus) tuples, total_count)
+        """
+
+    @abstractmethod
+    async def get_all_status_counts(self) -> dict[str, int]:
+        """Get counts of documents in each status for all documents
+
+        Returns:
+            Dictionary mapping status names to counts
+        """
+
+    @abstractmethod
+    async def get_doc_by_file_path(self, file_path: str) -> dict[str, Any] | None:
+        """Get document by file path
+
+        Args:
+            file_path: The file path to search for
+
+        Returns:
+            dict[str, Any] | None: Document data if found, None otherwise
+            Returns the same format as get_by_ids method
+        """
 
 
 class StoragesStatus(str, Enum):
@@ -593,3 +829,79 @@ class StoragesStatus(str, Enum):
     CREATED = "created"
     INITIALIZED = "initialized"
     FINALIZED = "finalized"
+
+
+@dataclass
+class DeletionResult:
+    """Represents the result of a deletion operation."""
+
+    status: Literal["success", "not_found", "fail"]
+    doc_id: str
+    message: str
+    status_code: int = 200
+    file_path: str | None = None
+
+
+# Unified Query Result Data Structures for Reference List Support
+
+
+@dataclass
+class QueryResult:
+    """
+    Unified query result data structure for all query modes.
+
+    Attributes:
+        content: Text content for non-streaming responses
+        response_iterator: Streaming response iterator for streaming responses
+        raw_data: Complete structured data including references and metadata
+        is_streaming: Whether this is a streaming result
+    """
+
+    content: Optional[str] = None
+    response_iterator: Optional[AsyncIterator[str]] = None
+    raw_data: Optional[Dict[str, Any]] = None
+    is_streaming: bool = False
+
+    @property
+    def reference_list(self) -> List[Dict[str, str]]:
+        """
+        Convenient property to extract reference list from raw_data.
+
+        Returns:
+            List[Dict[str, str]]: Reference list in format:
+            [{"reference_id": "1", "file_path": "/path/to/file.pdf"}, ...]
+        """
+        if self.raw_data:
+            return self.raw_data.get("data", {}).get("references", [])
+        return []
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        """
+        Convenient property to extract metadata from raw_data.
+
+        Returns:
+            Dict[str, Any]: Query metadata including query_mode, keywords, etc.
+        """
+        if self.raw_data:
+            return self.raw_data.get("metadata", {})
+        return {}
+
+
+@dataclass
+class QueryContextResult:
+    """
+    Unified query context result data structure.
+
+    Attributes:
+        context: LLM context string
+        raw_data: Complete structured data including reference_list
+    """
+
+    context: str
+    raw_data: Dict[str, Any]
+
+    @property
+    def reference_list(self) -> List[Dict[str, str]]:
+        """Convenient property to extract reference list from raw_data."""
+        return self.raw_data.get("data", {}).get("references", [])

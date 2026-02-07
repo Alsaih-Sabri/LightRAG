@@ -9,14 +9,16 @@ import {
   DialogDescription
 } from '@/components/ui/Dialog'
 import Button from '@/components/ui/Button'
+import Checkbox from '@/components/ui/Checkbox'
 
 interface PropertyEditDialogProps {
   isOpen: boolean
   onClose: () => void
-  onSave: (value: string) => void
+  onSave: (value: string, options?: { allowMerge?: boolean }) => void
   propertyName: string
   initialValue: string
   isSubmitting?: boolean
+  errorMessage?: string | null
 }
 
 /**
@@ -29,15 +31,18 @@ const PropertyEditDialog = ({
   onSave,
   propertyName,
   initialValue,
-  isSubmitting = false
+  isSubmitting = false,
+  errorMessage = null
 }: PropertyEditDialogProps) => {
   const { t } = useTranslation()
   const [value, setValue] = useState('')
+  const [allowMerge, setAllowMerge] = useState(false)
 
   // Initialize value when dialog opens
   useEffect(() => {
     if (isOpen) {
       setValue(initialValue)
+      setAllowMerge(false)
     }
   }, [isOpen, initialValue])
 
@@ -82,10 +87,11 @@ const PropertyEditDialog = ({
     }
   };
 
-  const handleSave = () => {
-    if (value.trim() !== '') {
-      onSave(value)
-      onClose()
+  const handleSave = async () => {
+    const trimmedValue = value.trim()
+    if (trimmedValue !== '') {
+      const options = propertyName === 'entity_id' ? { allowMerge } : undefined
+      await onSave(trimmedValue, options)
     }
   }
 
@@ -102,6 +108,13 @@ const PropertyEditDialog = ({
             {t('graphPanel.propertiesView.editPropertyDescription')}
           </DialogDescription>
         </DialogHeader>
+
+        {/* Display error message if save fails */}
+        {errorMessage && (
+          <div className="bg-destructive/15 text-destructive px-4 py-2 rounded-md text-sm">
+            {errorMessage}
+          </div>
+        )}
 
         {/* Multi-line text input using textarea */}
         <div className="grid gap-4 py-4">
@@ -127,6 +140,25 @@ const PropertyEditDialog = ({
           })()}
         </div>
 
+        {propertyName === 'entity_id' && (
+          <div className="rounded-md border border-border bg-muted/20 p-3">
+            <label className="flex items-start gap-2 text-sm font-medium">
+              <Checkbox
+                id="allow-merge"
+                checked={allowMerge}
+                disabled={isSubmitting}
+                onCheckedChange={(checked) => setAllowMerge(checked === true)}
+              />
+              <div>
+                <span>{t('graphPanel.propertiesView.mergeOptionLabel')}</span>
+                <p className="text-xs font-normal text-muted-foreground">
+                  {t('graphPanel.propertiesView.mergeOptionDescription')}
+                </p>
+              </div>
+            </label>
+          </div>
+        )}
+
         <DialogFooter>
           <Button
             type="button"
@@ -141,7 +173,19 @@ const PropertyEditDialog = ({
             onClick={handleSave}
             disabled={isSubmitting}
           >
-            {t('common.save')}
+            {isSubmitting ? (
+              <>
+                <span className="mr-2">
+                  <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                </span>
+                {t('common.saving')}
+              </>
+            ) : (
+              t('common.save')
+            )}
           </Button>
         </DialogFooter>
       </DialogContent>

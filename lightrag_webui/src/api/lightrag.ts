@@ -1,7 +1,8 @@
 import axios, { AxiosError } from 'axios'
-import { backendBaseUrl } from '@/lib/constants'
+import { backendBaseUrl, popularLabelsDefaultLimit, searchLabelsDefaultLimit } from '@/lib/constants'
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
+import { useAuthStore } from '@/stores/state'
 import { navigationService } from '@/services/navigation'
 
 // Types
@@ -35,17 +36,44 @@ export type LightragStatus = {
     embedding_binding: string
     embedding_binding_host: string
     embedding_model: string
-    max_tokens: number
     kv_storage: string
     doc_status_storage: string
     graph_storage: string
     vector_storage: string
+    workspace?: string
+    max_graph_nodes?: string
+    enable_rerank?: boolean
+    rerank_binding?: string | null
+    rerank_model?: string | null
+    rerank_binding_host?: string | null
+    summary_language: string
+    force_llm_summary_on_merge: boolean
+    max_parallel_insert: number
+    max_async: number
+    embedding_func_max_async: number
+    embedding_batch_num: number
+    cosine_threshold: number
+    min_rerank_score: number
+    related_chunk_number: number
   }
   update_status?: Record<string, any>
   core_version?: string
   api_version?: string
   auth_mode?: 'enabled' | 'disabled'
   pipeline_busy: boolean
+  keyed_locks?: {
+    process_id: number
+    cleanup_performed: {
+      mp_cleaned: number
+      async_cleaned: number
+    }
+    current_status: {
+      total_mp_locks: number
+      pending_mp_cleanup: number
+      total_async_locks: number
+      pending_async_cleanup: number
+    }
+  }
   webui_title?: string
   webui_description?: string
 }
@@ -72,6 +100,9 @@ export type QueryMode = 'naive' | 'local' | 'global' | 'hybrid' | 'mix' | 'bypas
 export type Message = {
   role: 'user' | 'assistant' | 'system'
   content: string
+  thinkingContent?: string
+  displayContent?: string
+  thinkingTime?: number | null
 }
 
 export type QueryRequest = {
@@ -88,16 +119,14 @@ export type QueryRequest = {
   stream?: boolean
   /** Number of top items to retrieve. Represents entities in 'local' mode and relationships in 'global' mode. */
   top_k?: number
-  /** Maximum number of tokens allowed for each retrieved text chunk. */
-  max_token_for_text_unit?: number
-  /** Maximum number of tokens allocated for relationship descriptions in global retrieval. */
-  max_token_for_global_context?: number
-  /** Maximum number of tokens allocated for entity descriptions in local retrieval. */
-  max_token_for_local_context?: number
-  /** List of high-level keywords to prioritize in retrieval. */
-  hl_keywords?: string[]
-  /** List of low-level keywords to refine retrieval focus. */
-  ll_keywords?: string[]
+  /** Maximum number of text chunks to retrieve and keep after reranking. */
+  chunk_top_k?: number
+  /** Maximum number of tokens allocated for entity context in unified token control system. */
+  max_entity_tokens?: number
+  /** Maximum number of tokens allocated for relationship context in unified token control system. */
+  max_relation_tokens?: number
+  /** Maximum total tokens budget for the entire query context (entities + relations + chunks + system prompt). */
+  max_total_tokens?: number
   /**
    * Stores past conversation history to maintain context.
    * Format: [{"role": "user/assistant", "content": "message"}].
@@ -105,18 +134,56 @@ export type QueryRequest = {
   conversation_history?: Message[]
   /** Number of complete conversation turns (user-assistant pairs) to consider in the response context. */
   history_turns?: number
+  /** User-provided prompt for the query. If provided, this will be used instead of the default value from prompt template. */
+  user_prompt?: string
+  /** Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued. Default is True. */
+  enable_rerank?: boolean
 }
 
 export type QueryResponse = {
   response: string
 }
 
+export type EntityUpdateResponse = {
+  status: string
+  message: string
+  data: Record<string, any>
+  operation_summary?: {
+    merged: boolean
+    merge_status: 'success' | 'failed' | 'not_attempted'
+    merge_error: string | null
+    operation_status: 'success' | 'partial_success' | 'failure'
+    target_entity: string | null
+    final_entity?: string | null
+    renamed?: boolean
+  }
+}
+
 export type DocActionResponse = {
   status: 'success' | 'partial_success' | 'failure' | 'duplicated'
   message: string
+  track_id?: string
 }
 
-export type DocStatus = 'pending' | 'processing' | 'processed' | 'failed'
+export type ScanResponse = {
+  status: 'scanning_started'
+  message: string
+  track_id: string
+}
+
+export type ReprocessFailedResponse = {
+  status: 'reprocessing_started'
+  message: string
+  track_id: string
+}
+
+export type DeleteDocResponse = {
+  status: 'deletion_started' | 'busy' | 'not_allowed'
+  message: string
+  doc_id: string
+}
+
+export type DocStatus = 'pending' | 'processing' | 'preprocessed' | 'processed' | 'failed'
 
 export type DocStatusResponse = {
   id: string
@@ -125,14 +192,49 @@ export type DocStatusResponse = {
   status: DocStatus
   created_at: string
   updated_at: string
+  track_id?: string
   chunks_count?: number
-  error?: string
+  error_msg?: string
   metadata?: Record<string, any>
   file_path: string
 }
 
 export type DocsStatusesResponse = {
   statuses: Record<DocStatus, DocStatusResponse[]>
+}
+
+export type TrackStatusResponse = {
+  track_id: string
+  documents: DocStatusResponse[]
+  total_count: number
+  status_summary: Record<string, number>
+}
+
+export type DocumentsRequest = {
+  status_filter?: DocStatus | null
+  page: number
+  page_size: number
+  sort_field: 'created_at' | 'updated_at' | 'id' | 'file_path'
+  sort_direction: 'asc' | 'desc'
+}
+
+export type PaginationInfo = {
+  page: number
+  page_size: number
+  total_count: number
+  total_pages: number
+  has_next: boolean
+  has_prev: boolean
+}
+
+export type PaginatedDocsResponse = {
+  documents: DocStatusResponse[]
+  pagination: PaginationInfo
+  status_counts: Record<string, number>
+}
+
+export type StatusCountsResponse = {
+  status_counts: Record<string, number>
 }
 
 export type AuthStatusResponse = {
@@ -156,6 +258,7 @@ export type PipelineStatusResponse = {
   batchs: number
   cur_batch: number
   request_pending: boolean
+  cancellation_requested?: boolean
   latest_message: string
   history_messages?: string[]
   update_status?: Record<string, any>
@@ -183,8 +286,62 @@ const axiosInstance = axios.create({
   }
 })
 
+// ========== Token Management ==========
+// Prevent multiple requests from triggering token refresh simultaneously
+let isRefreshingGuestToken = false;
+let refreshTokenPromise: Promise<string> | null = null;
+
+// Silent refresh for guest token
+const silentRefreshGuestToken = async (): Promise<string> => {
+  // If already refreshing, return the same Promise
+  if (isRefreshingGuestToken && refreshTokenPromise) {
+    return refreshTokenPromise;
+  }
+
+  isRefreshingGuestToken = true;
+  refreshTokenPromise = (async () => {
+    try {
+      // Call /auth-status to get new guest token
+      const response = await axios.get('/auth-status', {
+        baseURL: backendBaseUrl,
+        // This request must skip the interceptor to avoid adding expired token
+        headers: { 'X-Skip-Interceptor': 'true' }
+      });
+
+      if (response.data.access_token && !response.data.auth_configured) {
+        const newToken = response.data.access_token;
+        // Update localStorage
+        localStorage.setItem('LIGHTRAG-API-TOKEN', newToken);
+        // Update auth state
+        useAuthStore.getState().login(
+          newToken,
+          true,
+          response.data.core_version,
+          response.data.api_version,
+          response.data.webui_title || null,
+          response.data.webui_description || null
+        );
+        return newToken;
+      } else {
+        throw new Error('Failed to get guest token');
+      }
+    } finally {
+      isRefreshingGuestToken = false;
+      refreshTokenPromise = null;
+    }
+  })();
+
+  return refreshTokenPromise;
+};
+
 // Interceptor: add api key and check authentication
 axiosInstance.interceptors.request.use((config) => {
+  // Skip interceptor for token refresh requests
+  if (config.headers['X-Skip-Interceptor']) {
+    delete config.headers['X-Skip-Interceptor'];
+    return config;
+  }
+
   const apiKey = useSettingsStore.getState().apiKey
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
 
@@ -198,20 +355,88 @@ axiosInstance.interceptors.request.use((config) => {
   return config
 })
 
-// Interceptor：hanle error
+// Interceptor：handle token renewal and authentication errors
 axiosInstance.interceptors.response.use(
-  (response) => response,
-  (error: AxiosError) => {
+  (response) => {
+    // ========== Check for new token from backend ==========
+    const newToken = response.headers['x-new-token'];
+    if (newToken) {
+      localStorage.setItem('LIGHTRAG-API-TOKEN', newToken);
+
+      // Optional: log in development mode
+      if (import.meta.env.DEV) {
+        console.log('[Auth] Token auto-renewed by backend');
+      }
+
+      // Update auth state with renewal tracking
+      try {
+        const payload = JSON.parse(atob(newToken.split('.')[1]));
+        const authStore = useAuthStore.getState();
+        if (authStore.isAuthenticated) {
+          // Track token renewal time and expiration
+          const renewalTime = Date.now();
+          const expiresAt = payload.exp ? payload.exp * 1000 : 0;
+          authStore.setTokenRenewal(renewalTime, expiresAt);
+
+          // Update username (usually unchanged, but just in case)
+          const newUsername = payload.sub;
+          if (newUsername && newUsername !== authStore.username) {
+            // Need to add setUsername method or just update via login
+            // For now, we'll skip username update as it's rare
+          }
+        }
+      } catch (error) {
+        console.warn('[Auth] Failed to parse renewed token:', error);
+      }
+    }
+    // ========== End of token renewal check ==========
+
+    return response;
+  },
+  async (error: AxiosError) => {
     if (error.response) {
       if (error.response?.status === 401) {
-        // For login API, throw error directly
-        if (error.config?.url?.includes('/login')) {
+        const originalRequest = error.config;
+
+        // 1. For login API, throw error directly
+        if (originalRequest?.url?.includes('/login')) {
           throw error;
         }
-        // For other APIs, navigate to login page
-        navigationService.navigateToLogin();
 
-        // return a reject Promise
+        // 2. Prevent infinite retry
+        if (originalRequest && (originalRequest as any)._retry) {
+          navigationService.navigateToLogin();
+          return Promise.reject(new Error('Authentication required'));
+        }
+
+        // 3. Check if in guest mode
+        const authStore = useAuthStore.getState();
+        const currentToken = localStorage.getItem('LIGHTRAG-API-TOKEN');
+        const isGuest = currentToken && authStore.isGuestMode;
+
+        // 4. Guest mode: silent refresh and retry
+        if (isGuest && originalRequest) {
+          try {
+            const newToken = await silentRefreshGuestToken();
+
+            // Mark as retried to prevent infinite loop
+            (originalRequest as any)._retry = true;
+
+            // Update token in request headers
+            originalRequest.headers['Authorization'] = `Bearer ${newToken}`;
+
+            // Retry original request
+            return axiosInstance(originalRequest);
+          } catch (refreshError) {
+            console.error('Failed to refresh guest token:', refreshError);
+            // Refresh failed, navigate to login
+            navigationService.navigateToLogin();
+            return Promise.reject(new Error('Failed to refresh authentication'));
+          }
+        }
+
+        // 5. Non-guest mode: navigate to login page
+        navigationService.navigateToLogin();
         return Promise.reject(new Error('Authentication required'));
       }
       throw new Error(
@@ -239,6 +464,16 @@ export const getGraphLabels = async (): Promise<string[]> => {
   return response.data
 }
 
+export const getPopularLabels = async (limit: number = popularLabelsDefaultLimit): Promise<string[]> => {
+  const response = await axiosInstance.get(`/graph/label/popular?limit=${limit}`)
+  return response.data
+}
+
+export const searchLabels = async (query: string, limit: number = searchLabelsDefaultLimit): Promise<string[]> => {
+  const response = await axiosInstance.get(`/graph/label/search?q=${encodeURIComponent(query)}&limit=${limit}`)
+  return response.data
+}
+
 export const checkHealth = async (): Promise<
   LightragStatus | { status: 'error'; message: string }
 > => {
@@ -258,8 +493,13 @@ export const getDocuments = async (): Promise<DocsStatusesResponse> => {
   return response.data
 }
 
-export const scanNewDocuments = async (): Promise<{ status: string }> => {
+export const scanNewDocuments = async (): Promise<ScanResponse> => {
   const response = await axiosInstance.post('/documents/scan')
+  return response.data
+}
+
+export const reprocessFailedDocuments = async (): Promise<ReprocessFailedResponse> => {
+  const response = await axiosInstance.post('/documents/reprocess_failed')
   return response.data
 }
 
@@ -301,7 +541,88 @@ export const queryTextStream = async (
     if (!response.ok) {
       // Handle 401 Unauthorized error specifically
       if (response.status === 401) {
-        // For consistency with axios interceptor, navigate to login page
+        // Check if in guest mode
+        const authStore = useAuthStore.getState();
+        const currentToken = localStorage.getItem('LIGHTRAG-API-TOKEN');
+        const isGuest = currentToken && authStore.isGuestMode;
+
+        if (isGuest) {
+          try {
+            // Silent refresh token for guest mode
+            const newToken = await silentRefreshGuestToken();
+
+            // Retry stream request with new token
+            const retryHeaders = { ...headers };
+            retryHeaders['Authorization'] = `Bearer ${newToken}`;
+
+            const retryResponse = await fetch(`${backendBaseUrl}/query/stream`, {
+              method: 'POST',
+              headers: retryHeaders,
+              body: JSON.stringify(request),
+            });
+
+            if (!retryResponse.ok) {
+              throw new Error(`HTTP error! status: ${retryResponse.status}`);
+            }
+
+            // Retry successful, process stream response
+            // Re-execute the stream processing logic with retryResponse
+            if (!retryResponse.body) {
+              throw new Error('Response body is null');
+            }
+
+            const reader = retryResponse.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
+
+              for (const line of lines) {
+                if (line.trim()) {
+                  try {
+                    const parsed = JSON.parse(line);
+                    if (parsed.response) {
+                      onChunk(parsed.response);
+                    } else if (parsed.error) {
+                      onError?.(parsed.error);
+                    }
+                  } catch (parseError) {
+                    console.error('Failed to parse JSON:', parseError, 'Line:', line);
+                    onError?.(`JSON parse error: ${parseError}`);
+                  }
+                }
+              }
+            }
+
+            // Process any remaining data in buffer
+            if (buffer.trim()) {
+              try {
+                const parsed = JSON.parse(buffer);
+                if (parsed.response) {
+                  onChunk(parsed.response);
+                } else if (parsed.error) {
+                  onError?.(parsed.error);
+                }
+              } catch (parseError) {
+                console.error('Failed to parse final buffer:', parseError);
+              }
+            }
+
+            return; // Successfully completed retry
+          } catch (refreshError) {
+            console.error('Failed to refresh guest token for streaming:', refreshError);
+            navigationService.navigateToLogin();
+            throw new Error('Failed to refresh authentication');
+          }
+        }
+
+        // Non-guest mode: navigate to login page
         navigationService.navigateToLogin();
 
         // Create a specific authentication error
@@ -509,11 +830,22 @@ export const clearDocuments = async (): Promise<DocActionResponse> => {
   return response.data
 }
 
-export const clearCache = async (modes?: string[]): Promise<{
+export const clearCache = async (): Promise<{
   status: 'success' | 'fail'
   message: string
 }> => {
-  const response = await axiosInstance.post('/documents/clear_cache', { modes })
+  const response = await axiosInstance.post('/documents/clear_cache', {})
+  return response.data
+}
+
+export const deleteDocuments = async (
+  docIds: string[],
+  deleteFile: boolean = false,
+  deleteLLMCache: boolean = false
+): Promise<DeleteDocResponse> => {
+  const response = await axiosInstance.delete('/documents/delete_document', {
+    data: { doc_ids: docIds, delete_file: deleteFile, delete_llm_cache: deleteLLMCache }
+  })
   return response.data
 }
 
@@ -579,6 +911,14 @@ export const getPipelineStatus = async (): Promise<PipelineStatusResponse> => {
   return response.data
 }
 
+export const cancelPipeline = async (): Promise<{
+  status: 'cancellation_requested' | 'not_busy'
+  message: string
+}> => {
+  const response = await axiosInstance.post('/documents/cancel_pipeline')
+  return response.data
+}
+
 export const loginToServer = async (username: string, password: string): Promise<LoginResponse> => {
   const formData = new FormData();
   formData.append('username', username);
@@ -598,17 +938,20 @@ export const loginToServer = async (username: string, password: string): Promise
  * @param entityName The name of the entity to update
  * @param updatedData Dictionary containing updated attributes
  * @param allowRename Whether to allow renaming the entity (default: false)
+ * @param allowMerge Whether to merge into an existing entity when renaming to a duplicate name
  * @returns Promise with the updated entity information
  */
 export const updateEntity = async (
   entityName: string,
   updatedData: Record<string, any>,
-  allowRename: boolean = false
-): Promise<DocActionResponse> => {
+  allowRename: boolean = false,
+  allowMerge: boolean = false
+): Promise<EntityUpdateResponse> => {
   const response = await axiosInstance.post('/graph/entity/edit', {
     entity_name: entityName,
     updated_data: updatedData,
-    allow_rename: allowRename
+    allow_rename: allowRename,
+    allow_merge: allowMerge
   })
   return response.data
 }
@@ -646,4 +989,33 @@ export const checkEntityNameExists = async (entityName: string): Promise<boolean
     console.error('Error checking entity name:', error)
     return false
   }
+}
+
+/**
+ * Get the processing status of documents by tracking ID
+ * @param trackId The tracking ID returned from upload, text, or texts endpoints
+ * @returns Promise with the track status response containing documents and summary
+ */
+export const getTrackStatus = async (trackId: string): Promise<TrackStatusResponse> => {
+  const response = await axiosInstance.get(`/documents/track_status/${encodeURIComponent(trackId)}`)
+  return response.data
+}
+
+/**
+ * Get documents with pagination support
+ * @param request The pagination request parameters
+ * @returns Promise with paginated documents response
+ */
+export const getDocumentsPaginated = async (request: DocumentsRequest): Promise<PaginatedDocsResponse> => {
+  const response = await axiosInstance.post('/documents/paginated', request)
+  return response.data
+}
+
+/**
+ * Get counts of documents by status
+ * @returns Promise with status counts response
+ */
+export const getDocumentStatusCounts = async (): Promise<StatusCountsResponse> => {
+  const response = await axiosInstance.get('/documents/status_counts')
+  return response.data
 }
