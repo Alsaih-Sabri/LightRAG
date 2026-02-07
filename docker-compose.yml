@@ -1,3 +1,4 @@
+version:
 services:
   lightrag:
     container_name: lightrag
@@ -5,8 +6,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      tags:
-        - ghcr.io/hkuds/lightrag:latest
     ports:
       - "${PORT:-9621}:9621"
     volumes:
@@ -21,6 +20,8 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - dokploy-network
-  networks:
-    dokploy-network:
-       external: true
+
+# This must be at the very root (zero indentation)
+networks:
+  dokploy-network:
+    external: true
