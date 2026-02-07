@@ -18,9 +18,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
-      - dokploy-network
+      - shared-network
 
-# This must be at the very root (zero indentation)
 networks:
-  dokploy-network:
+  shared-network:
     external: true
