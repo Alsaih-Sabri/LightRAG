@@ -1,4 +1,3 @@
-version:
 services:
   lightrag:
     container_name: lightrag
